@@ -252,7 +252,10 @@ def get_finance_overview(period: str = "this_month", current_user: User = Depend
     now = datetime.utcnow()
     
     # Determine date range based on period
-    if period == "this_month":
+    if period == "today":
+        start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_date = now.replace(hour=23, minute=59, second=59, microsecond=999999)
+    elif period == "this_month":
         start_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         end_date = now
     elif period == "this_year":
@@ -278,45 +281,102 @@ def get_finance_overview(period: str = "this_month", current_user: User = Depend
         Transaction.type.in_(["sale", "return"])
     ).all()
     
-    # Query purchase orders for the period
-    purchase_orders = db.query(PurchaseOrder).filter(
-        PurchaseOrder.company_id == current_user.company_id,
-        PurchaseOrder.created_at >= start_date,
-        PurchaseOrder.created_at <= end_date
-    ).all()
-    
     # Query expenditures for the period
+    # We check both Expenditure.date and Expenditure.created_at to be safe
     expenditures = db.query(Expenditure).filter(
         Expenditure.company_id == current_user.company_id,
-        Expenditure.created_at >= start_date,
-        Expenditure.created_at <= end_date
+        ((Expenditure.date >= start_date) & (Expenditure.date <= end_date)) |
+        ((Expenditure.created_at >= start_date) & (Expenditure.created_at <= end_date))
+    ).all()
+
+    # Query salaries for the period
+    salaries = db.query(StaffSalary).filter(
+        StaffSalary.company_id == current_user.company_id,
+        StaffSalary.payment_date >= start_date,
+        StaffSalary.payment_date <= end_date
     ).all()
     
+    # Query all salaries for this user if they are a cashier (for their personal card)
+    my_salaries = []
+    if current_user.role == "cashier":
+        my_salaries = db.query(StaffSalary).filter(
+            StaffSalary.company_id == current_user.company_id,
+            StaffSalary.staff_id == current_user.id,
+            StaffSalary.payment_date >= start_date,
+            StaffSalary.payment_date <= end_date
+        ).all()
+    
     # Calculate totals
-    # Net revenue: sales - returns
     gross_revenue = sum(t.total for t in transactions if t.type == "sale")
     total_refunds = sum(t.total for t in transactions if t.type == "return")
     total_revenue = gross_revenue - total_refunds
     
-    total_costs = sum(po.total for po in purchase_orders) + sum(e.amount for e in expenditures)
-    total_profit = total_revenue - total_costs
-    profit_margin = (total_profit / total_revenue * 100) if total_revenue > 0 else 0
+    expenditure_total = sum(e.amount for e in expenditures)
+    salary_total = sum(s.amount for s in salaries)
+    my_salary_total = sum(s.amount for s in my_salaries)
+    total_costs = expenditure_total + salary_total
     
+    net_profit = total_revenue - total_costs
+    
+    # Cashflow: actually collected amount minus costs
+    total_paid = sum(t.amount_paid for t in transactions if t.type == "sale") - sum(t.amount_paid for t in transactions if t.type == "return")
+    cashflow = total_paid - total_costs
+
+    # Calculate Trend (last 6 months)
+    trend = []
+    for i in range(5, -1, -1):
+        # Calculate month start and end
+        # Using a more robust month calculation
+        month_offset = i
+        m_start = (now.replace(day=1) - timedelta(days=month_offset * 30)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if i == 0:
+            m_end = now
+        else:
+            m_end = (m_start + timedelta(days=32)).replace(day=1) - timedelta(seconds=1)
+        
+        m_sales = db.query(Transaction).filter(
+            Transaction.company_id == current_user.company_id,
+            Transaction.created_at >= m_start,
+            Transaction.created_at <= m_end,
+            Transaction.type == "sale"
+        ).all()
+        
+        m_exp = db.query(Expenditure).filter(
+            Expenditure.company_id == current_user.company_id,
+            ((Expenditure.date >= m_start) & (Expenditure.date <= m_end)) |
+            ((Expenditure.created_at >= m_start) & (Expenditure.created_at <= m_end))
+        ).all()
+        
+        m_sal = db.query(StaffSalary).filter(
+            StaffSalary.company_id == current_user.company_id,
+            StaffSalary.payment_date >= m_start,
+            StaffSalary.payment_date <= m_end
+        ).all()
+
+        rev = sum(s.total for s in m_sales)
+        cost = sum(e.amount for e in m_exp) + sum(s.amount for s in m_sal)
+        
+        trend.append({
+            "month": m_start.strftime("%b"),
+            "revenue": rev,
+            "expenses": cost
+        })
+
     return {
         "period": period,
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
+        "net_profit": net_profit,
+        "cashflow": cashflow,
+        "salary_total": salary_total,
+        "my_salary_total": my_salary_total,
+        "expenditure_total": expenditure_total,
         "total_revenue": total_revenue,
-        "gross_revenue": gross_revenue,
-        "total_refunds": total_refunds,
         "total_costs": total_costs,
-        "total_profit": total_profit,
-        "profit_margin": profit_margin,
-        "transaction_count": len([t for t in transactions if t.type == "sale"]),
-        "average_transaction": total_revenue / len([t for t in transactions if t.type == "sale"]) if [t for t in transactions if t.type == "sale"] else 0,
-        "total_paid": sum(t.amount_paid for t in transactions if t.type == "sale") - sum(t.amount_paid for t in transactions if t.type == "return"),
-        "total_due": sum(t.amount_due for t in transactions if t.type == "sale") - sum(t.amount_due for t in transactions if t.type == "return"),
+        "trend": trend
     }
+
+
 
 @app.get("/admin/subscription-plans", response_model=list[SubscriptionPlanOut])
 def list_subscription_plans(_: User = Depends(get_current_user), db: Session = Depends(get_db)):
